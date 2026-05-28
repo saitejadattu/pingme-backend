@@ -308,6 +308,9 @@ async def sync_google_calendar_range(
             update_fields["raw_input"] = event.get("description") or event["title"]
         if reminder.get("remind_at") != event_start and event_start > now:
             update_fields["email_sent"] = False
+            update_fields["reminder_attempt_count"] = 0
+            update_fields["next_notification_at"] = event_start
+            update_fields["reminder_sequence_completed"] = False
         if (
             reminder.get("title") != update_fields["title"]
             or (
@@ -316,6 +319,9 @@ async def sync_google_calendar_range(
             )
             or reminder.get("remind_at") != update_fields["remind_at"]
             or reminder.get("email_sent") != update_fields.get("email_sent", reminder.get("email_sent"))
+            or reminder.get("reminder_attempt_count") != update_fields.get("reminder_attempt_count", reminder.get("reminder_attempt_count"))
+            or reminder.get("next_notification_at") != update_fields.get("next_notification_at", reminder.get("next_notification_at"))
+            or reminder.get("reminder_sequence_completed") != update_fields.get("reminder_sequence_completed", reminder.get("reminder_sequence_completed"))
         ):
             await db.reminders.update_one({"_id": reminder["_id"]}, {"$set": update_fields})
 
@@ -331,14 +337,18 @@ async def sync_google_calendar_range(
                 "raw_input": event.get("description") or event["title"],
                 "remind_at": event_start,
                 "is_done": False,
-                "email_sent": event_start <= now,
+                "email_sent": False,
                 "client_email": None,
                 "client_name": None,
+                "client_topic": None,
                 "client_message": None,
                 "client_email_sent": False,
                 "calendar_invite_sent": False,
                 "google_event_id": event["id"],
                 "sync_source": "google",
+                "reminder_attempt_count": 0 if event_start > now else 5,
+                "next_notification_at": event_start if event_start > now else None,
+                "reminder_sequence_completed": event_start <= now,
                 "created_at": now,
             }
         )

@@ -34,6 +34,9 @@ async def connect_to_mongo() -> AsyncIOMotorDatabase:
         partialFilterExpression={"google_event_id": {"$type": "string"}},
     )
     await database.db.reminders.create_index(
+        [("next_notification_at", 1), ("is_done", 1), ("reminder_sequence_completed", 1)]
+    )
+    await database.db.reminders.create_index(
         [("email_sent", 1), ("is_done", 1), ("remind_at", 1)]
     )
     return database.db

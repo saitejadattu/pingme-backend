@@ -47,6 +47,9 @@ class ReminderResponse(BaseModel):
     calendar_invite_sent: bool = False
     google_event_id: Optional[str] = None
     sync_source: str = "pingme"
+    reminder_attempt_count: int = 0
+    next_notification_at: Optional[datetime] = None
+    reminder_sequence_completed: bool = False
     created_at: datetime
 
     model_config = ConfigDict(from_attributes=True)

@@ -37,6 +37,9 @@ def serialize_reminder(reminder: dict) -> ReminderResponse:
         calendar_invite_sent=reminder.get("calendar_invite_sent", False),
         google_event_id=reminder.get("google_event_id"),
         sync_source=reminder.get("sync_source", "pingme"),
+        reminder_attempt_count=reminder.get("reminder_attempt_count", 0),
+        next_notification_at=ensure_utc(reminder["next_notification_at"]) if reminder.get("next_notification_at") else None,
+        reminder_sequence_completed=reminder.get("reminder_sequence_completed", False),
         created_at=ensure_utc(reminder["created_at"]),
     )
 
@@ -64,6 +67,9 @@ async def _persist_reminder(user: dict, payload: dict) -> ReminderResponse:
         "calendar_invite_sent": False,
         "google_event_id": None,
         "sync_source": "pingme",
+        "reminder_attempt_count": 0,
+        "next_notification_at": payload["remind_at"],
+        "reminder_sequence_completed": False,
         "created_at": datetime.now(timezone.utc),
     }
     try:
@@ -151,7 +157,7 @@ async def mark_done(reminder_id: str, current_user=CurrentUser):
     db = get_database()
     await db.reminders.update_one(
         {"_id": ObjectId(reminder_id), "user_id": current_user["_id"]},
-        {"$set": {"is_done": True}},
+        {"$set": {"is_done": True, "reminder_sequence_completed": True, "next_notification_at": None}},
     )
     reminder = await db.reminders.find_one({"_id": ObjectId(reminder_id), "user_id": current_user["_id"]})
     if not reminder:
@@ -219,6 +225,9 @@ async def edit_reminder(reminder_id: str, payload: ReminderEdit, current_user=Cu
 
     if remind_at_utc > datetime.now(timezone.utc):
         updated_doc["email_sent"] = False
+        updated_doc["reminder_attempt_count"] = 0
+        updated_doc["next_notification_at"] = remind_at_utc
+        updated_doc["reminder_sequence_completed"] = False
         if payload.client_email:
             updated_doc["client_email_sent"] = False
 
