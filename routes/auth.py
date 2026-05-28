@@ -64,6 +64,7 @@ def build_oauth_redirect(token: str, user: UserResponse) -> str:
             "email": user.email,
             "phone": user.phone or "",
             "is_verified": str(user.is_verified).lower(),
+            "google_calendar_connected": str(user.google_calendar_connected).lower(),
         }
     )
     return f"{FRONTEND_URL}/oauth/callback?{params}"
