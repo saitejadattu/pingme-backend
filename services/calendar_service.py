@@ -174,6 +174,35 @@ def update_calendar_event(user: dict[str, Any], event_id: str, reminder: dict[st
     service.events().patch(calendarId="primary", eventId=event_id, body=event).execute()
 
 
+def update_google_calendar_event(
+    user: dict[str, Any],
+    event_id: str,
+    title: str,
+    start: datetime | str,
+    end: datetime | str,
+    is_all_day: bool,
+) -> None:
+    credentials = _build_credentials(user)
+    if credentials is None:
+        return
+    service = build("calendar", "v3", credentials=credentials, cache_discovery=False)
+    if is_all_day:
+        event = {
+            "summary": title,
+            "start": {"date": str(start)},
+            "end": {"date": str(end)},
+        }
+    else:
+        start_dt = start if isinstance(start, datetime) else datetime.fromisoformat(str(start))
+        end_dt = end if isinstance(end, datetime) else datetime.fromisoformat(str(end))
+        event = {
+            "summary": title,
+            "start": {"dateTime": start_dt.isoformat(), "timeZone": "Asia/Kolkata"},
+            "end": {"dateTime": end_dt.isoformat(), "timeZone": "Asia/Kolkata"},
+        }
+    service.events().patch(calendarId="primary", eventId=event_id, body=event).execute()
+
+
 def _normalize_google_event(event: dict[str, Any]) -> dict[str, Any] | None:
     if event.get("status") == "cancelled":
         return None
@@ -353,7 +382,12 @@ async def sync_google_calendar_range(
             }
         )
 
-    reminders = await db.reminders.find({"user_id": user["_id"]}).sort("remind_at", 1).to_list(1000)
+    reminders = await db.reminders.find(
+        {
+            "user_id": user["_id"],
+            "remind_at": {"$gte": time_min - timedelta(days=1), "$lt": time_max + timedelta(days=1)},
+        }
+    ).sort("remind_at", 1).to_list(1000)
     return reminders
 
 

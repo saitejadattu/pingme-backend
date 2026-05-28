@@ -1,10 +1,21 @@
 from datetime import datetime, timedelta, timezone
 
+from datetime import date
+
+from bson import ObjectId
 from fastapi import APIRouter, HTTPException, Query
 
+from config.database import get_database
 from middleware.auth_middleware import CurrentUser
+from models.google_calendar import GoogleCalendarEventEdit
 from routes.reminders import serialize_reminder
-from services.calendar_service import get_google_auth_url, list_calendar_events, sync_google_calendar_range
+from services.calendar_service import (
+    delete_calendar_event,
+    get_google_auth_url,
+    list_calendar_events,
+    sync_google_calendar_range,
+    update_google_calendar_event,
+)
 
 router = APIRouter(prefix="/google-calendar", tags=["google-calendar"])
 
@@ -63,3 +74,63 @@ async def sync_google_calendar_events(
 
     reminders = await sync_google_calendar_range(current_user, start, end)
     return [serialize_reminder(reminder) for reminder in reminders]
+
+
+@router.patch("/events/{event_id}")
+async def edit_google_calendar_event(
+    event_id: str,
+    payload: GoogleCalendarEventEdit,
+    current_user=CurrentUser,
+):
+    db = get_database()
+    try:
+      if payload.is_all_day:
+          start_value = payload.start if isinstance(payload.start, str) else payload.start.date().isoformat()
+          end_value = payload.end if isinstance(payload.end, str) else payload.end.date().isoformat()
+      else:
+          start_value = payload.start if isinstance(payload.start, datetime) else datetime.fromisoformat(str(payload.start))
+          end_value = payload.end if isinstance(payload.end, datetime) else datetime.fromisoformat(str(payload.end))
+          if start_value.tzinfo is None:
+              start_value = start_value.replace(tzinfo=timezone.utc)
+          if end_value.tzinfo is None:
+              end_value = end_value.replace(tzinfo=timezone.utc)
+
+      update_google_calendar_event(
+          current_user,
+          event_id,
+          payload.title,
+          start_value,
+          end_value,
+          payload.is_all_day,
+      )
+    except Exception as exc:
+      raise HTTPException(status_code=502, detail="Could not update Google Calendar event") from exc
+
+    update_fields = {"title": payload.title}
+    if payload.is_all_day:
+        start_date = date.fromisoformat(str(start_value))
+        update_fields["remind_at"] = datetime.combine(start_date, datetime.min.time(), tzinfo=timezone.utc) - timedelta(hours=5, minutes=30)
+        update_fields["raw_input"] = payload.title
+    else:
+        update_fields["remind_at"] = start_value.astimezone(timezone.utc)
+        update_fields["raw_input"] = payload.title
+
+    await db.reminders.update_many(
+        {"user_id": current_user["_id"], "google_event_id": event_id},
+        {"$set": update_fields},
+    )
+    return {"message": "Google event updated"}
+
+
+@router.delete("/events/{event_id}")
+async def remove_google_calendar_event(event_id: str, current_user=CurrentUser):
+    db = get_database()
+    try:
+        delete_calendar_event(current_user, event_id)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail="Could not delete Google Calendar event") from exc
+
+    await db.reminders.delete_many(
+        {"user_id": current_user["_id"], "google_event_id": event_id}
+    )
+    return {"message": "Google event deleted"}
