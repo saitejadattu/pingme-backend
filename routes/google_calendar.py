@@ -20,6 +20,22 @@ from services.calendar_service import (
 router = APIRouter(prefix="/google-calendar", tags=["google-calendar"])
 
 
+def _parse_range(date_from: str, date_to: str) -> tuple[datetime, datetime]:
+    try:
+        start = datetime.fromisoformat(date_from)
+        end = datetime.fromisoformat(date_to)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Invalid date range") from exc
+
+    if start.tzinfo is None:
+        start = start.replace(tzinfo=timezone.utc)
+    if end.tzinfo is None:
+        end = end.replace(tzinfo=timezone.utc)
+    if end <= start:
+        end = start + timedelta(days=1)
+    return start, end
+
+
 @router.get("/connect")
 async def connect_google_calendar(current_user=CurrentUser):
     return {"auth_url": get_google_auth_url(f"user:{current_user['_id']}")}
@@ -34,18 +50,7 @@ async def get_google_calendar_events(
     if not current_user.get("google_calendar_token"):
         return []
 
-    try:
-        start = datetime.fromisoformat(date_from)
-        end = datetime.fromisoformat(date_to)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail="Invalid date range") from exc
-
-    if start.tzinfo is None:
-        start = start.replace(tzinfo=timezone.utc)
-    if end.tzinfo is None:
-        end = end.replace(tzinfo=timezone.utc)
-    if end <= start:
-        end = start + timedelta(days=1)
+    start, end = _parse_range(date_from, date_to)
 
     return list_calendar_events(current_user, start, end)
 
@@ -59,21 +64,28 @@ async def sync_google_calendar_events(
     if not current_user.get("google_calendar_token"):
         return []
 
-    try:
-        start = datetime.fromisoformat(date_from)
-        end = datetime.fromisoformat(date_to)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail="Invalid date range") from exc
-
-    if start.tzinfo is None:
-        start = start.replace(tzinfo=timezone.utc)
-    if end.tzinfo is None:
-        end = end.replace(tzinfo=timezone.utc)
-    if end <= start:
-        end = start + timedelta(days=1)
+    start, end = _parse_range(date_from, date_to)
 
     reminders = await sync_google_calendar_range(current_user, start, end)
     return [serialize_reminder(reminder) for reminder in reminders]
+
+
+@router.get("/range")
+async def get_google_calendar_range(
+    date_from: str = Query(...),
+    date_to: str = Query(...),
+    current_user=CurrentUser,
+):
+    if not current_user.get("google_calendar_token"):
+        return {"reminders": [], "events": []}
+
+    start, end = _parse_range(date_from, date_to)
+    reminders = await sync_google_calendar_range(current_user, start, end)
+    events = list_calendar_events(current_user, start, end)
+    return {
+        "reminders": [serialize_reminder(reminder) for reminder in reminders],
+        "events": events,
+    }
 
 
 @router.patch("/events/{event_id}")
