@@ -9,6 +9,7 @@ from middleware.auth_middleware import CurrentUser
 from models.reminder import ManualReminderCreate, ReminderCreate, ReminderEdit, ReminderResponse
 from services.calendar_service import create_calendar_event, delete_calendar_event, update_calendar_event
 from services.gemini_service import parse_reminder
+from services.scheduler_service import cancel_reminder_schedule, sync_reminder_schedule
 
 router = APIRouter(prefix="/reminders", tags=["reminders"])
 IST = ZoneInfo("Asia/Kolkata")
@@ -40,6 +41,11 @@ def serialize_reminder(reminder: dict) -> ReminderResponse:
         reminder_attempt_count=reminder.get("reminder_attempt_count", 0),
         next_notification_at=ensure_utc(reminder["next_notification_at"]) if reminder.get("next_notification_at") else None,
         reminder_sequence_completed=reminder.get("reminder_sequence_completed", False),
+        scheduler_provider=reminder.get("scheduler_provider"),
+        scheduled_notification_jobs=reminder.get("scheduled_notification_jobs", []),
+        scheduled_notification_times=[
+            ensure_utc(scheduled_time) for scheduled_time in reminder.get("scheduled_notification_times", [])
+        ],
         created_at=ensure_utc(reminder["created_at"]),
     )
 
@@ -70,6 +76,9 @@ async def _persist_reminder(user: dict, payload: dict) -> ReminderResponse:
         "reminder_attempt_count": 0,
         "next_notification_at": payload["remind_at"],
         "reminder_sequence_completed": False,
+        "scheduler_provider": None,
+        "scheduled_notification_jobs": [],
+        "scheduled_notification_times": [],
         "created_at": datetime.now(timezone.utc),
     }
     try:
@@ -88,6 +97,10 @@ async def _persist_reminder(user: dict, payload: dict) -> ReminderResponse:
 
     result = await db.reminders.insert_one(reminder_doc)
     saved = await db.reminders.find_one({"_id": result.inserted_id})
+    scheduler_metadata = await sync_reminder_schedule(saved)
+    if scheduler_metadata:
+        await db.reminders.update_one({"_id": result.inserted_id}, {"$set": scheduler_metadata})
+        saved = await db.reminders.find_one({"_id": result.inserted_id})
     return serialize_reminder(saved)
 
 
@@ -155,13 +168,22 @@ async def reminders_for_date(target_date: str, current_user=CurrentUser):
 @router.patch("/{reminder_id}/done", response_model=ReminderResponse)
 async def mark_done(reminder_id: str, current_user=CurrentUser):
     db = get_database()
-    await db.reminders.update_one(
-        {"_id": ObjectId(reminder_id), "user_id": current_user["_id"]},
-        {"$set": {"is_done": True, "reminder_sequence_completed": True, "next_notification_at": None}},
-    )
     reminder = await db.reminders.find_one({"_id": ObjectId(reminder_id), "user_id": current_user["_id"]})
     if not reminder:
         raise HTTPException(status_code=404, detail="Reminder not found")
+    schedule_cleanup = await cancel_reminder_schedule(reminder)
+    await db.reminders.update_one(
+        {"_id": ObjectId(reminder_id), "user_id": current_user["_id"]},
+        {
+            "$set": {
+                "is_done": True,
+                "reminder_sequence_completed": True,
+                "next_notification_at": None,
+                **schedule_cleanup,
+            }
+        },
+    )
+    reminder = await db.reminders.find_one({"_id": ObjectId(reminder_id), "user_id": current_user["_id"]})
     return serialize_reminder(reminder)
 
 
@@ -171,6 +193,7 @@ async def delete_reminder(reminder_id: str, current_user=CurrentUser):
     reminder = await db.reminders.find_one({"_id": ObjectId(reminder_id), "user_id": current_user["_id"]})
     if not reminder:
         raise HTTPException(status_code=404, detail="Reminder not found")
+    await cancel_reminder_schedule(reminder)
     if reminder.get("google_event_id"):
         try:
             delete_calendar_event(current_user, reminder["google_event_id"])
@@ -230,6 +253,8 @@ async def edit_reminder(reminder_id: str, payload: ReminderEdit, current_user=Cu
         updated_doc["reminder_sequence_completed"] = False
         if payload.client_email:
             updated_doc["client_email_sent"] = False
+        reminder_for_schedule = {**reminder, **updated_doc}
+        updated_doc.update(await sync_reminder_schedule(reminder_for_schedule))
 
     await db.reminders.update_one(
         {"_id": reminder["_id"]},

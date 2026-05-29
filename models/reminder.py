@@ -50,6 +50,9 @@ class ReminderResponse(BaseModel):
     reminder_attempt_count: int = 0
     next_notification_at: Optional[datetime] = None
     reminder_sequence_completed: bool = False
+    scheduler_provider: Optional[str] = None
+    scheduled_notification_jobs: list[str] = []
+    scheduled_notification_times: list[datetime] = []
     created_at: datetime
 
     model_config = ConfigDict(from_attributes=True)

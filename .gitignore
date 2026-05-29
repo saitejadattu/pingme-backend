@@ -2,3 +2,5 @@
 .env.example
 __pycache__/
 *.pyc
+dist/
+response*.json
