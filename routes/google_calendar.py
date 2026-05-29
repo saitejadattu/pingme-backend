@@ -52,7 +52,7 @@ async def get_google_calendar_events(
 
     start, end = _parse_range(date_from, date_to)
 
-    return list_calendar_events(current_user, start, end)
+    return await list_calendar_events(current_user, start, end)
 
 
 @router.post("/sync")
@@ -81,7 +81,7 @@ async def get_google_calendar_range(
 
     start, end = _parse_range(date_from, date_to)
     reminders = await sync_google_calendar_range(current_user, start, end)
-    events = list_calendar_events(current_user, start, end)
+    events = await list_calendar_events(current_user, start, end)
     return {
         "reminders": [serialize_reminder(reminder) for reminder in reminders],
         "events": events,
@@ -107,7 +107,7 @@ async def edit_google_calendar_event(
           if end_value.tzinfo is None:
               end_value = end_value.replace(tzinfo=timezone.utc)
 
-      update_google_calendar_event(
+      await update_google_calendar_event(
           current_user,
           event_id,
           payload.title,
@@ -138,7 +138,7 @@ async def edit_google_calendar_event(
 async def remove_google_calendar_event(event_id: str, current_user=CurrentUser):
     db = get_database()
     try:
-        delete_calendar_event(current_user, event_id)
+        await delete_calendar_event(current_user, event_id)
     except Exception as exc:
         raise HTTPException(status_code=502, detail="Could not delete Google Calendar event") from exc
 

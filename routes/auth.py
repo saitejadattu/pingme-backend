@@ -175,7 +175,7 @@ async def google_callback(
     if not code:
         raise HTTPException(status_code=400, detail="Missing authorization code")
     if state == "auth-login":
-        tokens = exchange_code_for_tokens(code, CALENDAR_SCOPES)
+        tokens = await exchange_code_for_tokens(code, CALENDAR_SCOPES)
         google_user = await fetch_google_user_info(tokens["token"])
         email = google_user.get("email", "").lower()
         if not email:
@@ -223,7 +223,7 @@ async def google_callback(
     if not state.startswith("user:"):
         raise HTTPException(status_code=400, detail="Missing user state")
     user_id = state.split("user:", 1)[1]
-    tokens = exchange_code_for_tokens(code, CALENDAR_SCOPES)
+    tokens = await exchange_code_for_tokens(code, CALENDAR_SCOPES)
     await db.users.update_one(
         {"_id": ObjectId(user_id)},
         {"$set": {"google_calendar_token": tokens}},

@@ -82,7 +82,7 @@ async def _persist_reminder(user: dict, payload: dict) -> ReminderResponse:
         "created_at": datetime.now(timezone.utc),
     }
     try:
-        reminder_doc["google_event_id"] = create_calendar_event(user, reminder_doc)
+        reminder_doc["google_event_id"] = await create_calendar_event(user, reminder_doc)
     except Exception as exc:
         raise HTTPException(
             status_code=502,
@@ -196,7 +196,7 @@ async def delete_reminder(reminder_id: str, current_user=CurrentUser):
     await cancel_reminder_schedule(reminder)
     if reminder.get("google_event_id"):
         try:
-            delete_calendar_event(current_user, reminder["google_event_id"])
+            await delete_calendar_event(current_user, reminder["google_event_id"])
         except Exception:
             pass
     await db.reminders.delete_one({"_id": reminder["_id"]})
@@ -231,7 +231,7 @@ async def edit_reminder(reminder_id: str, payload: ReminderEdit, current_user=Cu
 
     if reminder.get("google_event_id"):
         try:
-            update_calendar_event(
+            await update_calendar_event(
                 current_user,
                 reminder["google_event_id"],
                 {

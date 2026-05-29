@@ -61,32 +61,35 @@ def get_google_auth_url(state: str, scopes: list[str] | None = None) -> str:
     return f"https://accounts.google.com/o/oauth2/v2/auth?{urlencode(params)}"
 
 
-def exchange_code_for_tokens(code: str, scopes: list[str] | None = None) -> dict[str, Any]:
-    flow = Flow.from_client_config(
-        {
-            "web": {
-                "client_id": GOOGLE_CLIENT_ID,
-                "client_secret": GOOGLE_CLIENT_SECRET,
-                "auth_uri": "https://accounts.google.com/o/oauth2/auth",
-                "token_uri": "https://oauth2.googleapis.com/token",
-                "redirect_uris": [GOOGLE_REDIRECT_URI],
-            }
-        },
-        scopes=scopes or CALENDAR_SCOPES,
-        redirect_uri=GOOGLE_REDIRECT_URI,
-    )
-    flow.fetch_token(code=code)
-    credentials = flow.credentials
-    return {
-        "token": credentials.token,
-        "refresh_token": credentials.refresh_token,
-        "token_uri": credentials.token_uri,
-        "client_id": credentials.client_id,
-        "client_secret": credentials.client_secret,
-        "scopes": credentials.scopes,
-        "expiry": credentials.expiry.isoformat() if credentials.expiry else None,
-        "id_token": getattr(credentials, "id_token", None),
-    }
+async def exchange_code_for_tokens(code: str, scopes: list[str] | None = None) -> dict[str, Any]:
+    def _exchange() -> dict[str, Any]:
+        flow = Flow.from_client_config(
+            {
+                "web": {
+                    "client_id": GOOGLE_CLIENT_ID,
+                    "client_secret": GOOGLE_CLIENT_SECRET,
+                    "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+                    "token_uri": "https://oauth2.googleapis.com/token",
+                    "redirect_uris": [GOOGLE_REDIRECT_URI],
+                }
+            },
+            scopes=scopes or CALENDAR_SCOPES,
+            redirect_uri=GOOGLE_REDIRECT_URI,
+        )
+        flow.fetch_token(code=code)
+        credentials = flow.credentials
+        return {
+            "token": credentials.token,
+            "refresh_token": credentials.refresh_token,
+            "token_uri": credentials.token_uri,
+            "client_id": credentials.client_id,
+            "client_secret": credentials.client_secret,
+            "scopes": credentials.scopes,
+            "expiry": credentials.expiry.isoformat() if credentials.expiry else None,
+            "id_token": getattr(credentials, "id_token", None),
+        }
+
+    return await asyncio.to_thread(_exchange)
 
 
 async def fetch_google_user_info(access_token: str) -> dict[str, Any]:
@@ -99,10 +102,19 @@ async def fetch_google_user_info(access_token: str) -> dict[str, Any]:
         return response.json()
 
 
-def _build_credentials(user: dict[str, Any]) -> Credentials | None:
+def _build_credentials(
+    user: dict[str, Any],
+) -> tuple[Credentials | None, dict[str, Any] | None]:
+    """Build Google credentials, refreshing if needed.
+
+    Returns a tuple of (credentials, refreshed_token_data). The second value is
+    non-None only when the access token was refreshed and the caller must
+    persist it. This function performs blocking network I/O (token refresh and,
+    indirectly, discovery) so it must be run via ``asyncio.to_thread``.
+    """
     token_data = user.get("google_calendar_token")
     if not token_data:
-        return None
+        return None, None
     original_token = token_data.get("token")
     original_expiry = token_data.get("expiry")
     original_refresh_token = user.get("google_refresh_token") or token_data.get("refresh_token")
@@ -114,6 +126,7 @@ def _build_credentials(user: dict[str, Any]) -> Credentials | None:
         client_secret=token_data.get("client_secret") or GOOGLE_CLIENT_SECRET,
         scopes=token_data.get("scopes", CALENDAR_SCOPES),
     )
+    refreshed_token_data: dict[str, Any] | None = None
     if credentials.expired and credentials.refresh_token:
         credentials.refresh(Request())
         refreshed_expiry = credentials.expiry.isoformat() if credentials.expiry else None
@@ -130,51 +143,64 @@ def _build_credentials(user: dict[str, Any]) -> Credentials | None:
                 "refresh_token": refreshed_refresh_token,
                 "expiry": refreshed_expiry,
             }
-            loop = asyncio.get_running_loop()
-            loop.create_task(
-                _persist_refreshed_tokens(
-                    ObjectId(user["_id"]),
-                    refreshed_token_data,
-                    refreshed_refresh_token,
-                )
-            )
+    return credentials, refreshed_token_data
+
+
+async def _get_credentials(user: dict[str, Any]) -> Credentials | None:
+    """Async wrapper that builds credentials off the event loop and durably
+    persists any refreshed token before returning."""
+    credentials, refreshed_token_data = await asyncio.to_thread(_build_credentials, user)
+    if refreshed_token_data is not None:
+        await _persist_refreshed_tokens(
+            ObjectId(user["_id"]),
+            refreshed_token_data,
+            refreshed_token_data.get("refresh_token"),
+        )
     return credentials
 
 
-def create_calendar_event(user: dict[str, Any], reminder: dict[str, Any]) -> str | None:
-    credentials = _build_credentials(user)
+async def create_calendar_event(user: dict[str, Any], reminder: dict[str, Any]) -> str | None:
+    credentials = await _get_credentials(user)
     if credentials is None:
         return None
-    service = build("calendar", "v3", credentials=credentials, cache_discovery=False)
-    start = reminder["remind_at"]
-    end = start + timedelta(hours=1)
-    event = {
-        "summary": reminder["title"],
-        "description": reminder["raw_input"],
-        "start": {"dateTime": start.isoformat(), "timeZone": "Asia/Kolkata"},
-        "end": {"dateTime": end.isoformat(), "timeZone": "Asia/Kolkata"},
-    }
-    created = service.events().insert(calendarId="primary", body=event).execute()
-    return created.get("id")
+
+    def _create() -> str | None:
+        service = build("calendar", "v3", credentials=credentials, cache_discovery=False)
+        start = reminder["remind_at"]
+        end = start + timedelta(hours=1)
+        event = {
+            "summary": reminder["title"],
+            "description": reminder["raw_input"],
+            "start": {"dateTime": start.isoformat(), "timeZone": "Asia/Kolkata"},
+            "end": {"dateTime": end.isoformat(), "timeZone": "Asia/Kolkata"},
+        }
+        created = service.events().insert(calendarId="primary", body=event).execute()
+        return created.get("id")
+
+    return await asyncio.to_thread(_create)
 
 
-def update_calendar_event(user: dict[str, Any], event_id: str, reminder: dict[str, Any]) -> None:
-    credentials = _build_credentials(user)
+async def update_calendar_event(user: dict[str, Any], event_id: str, reminder: dict[str, Any]) -> None:
+    credentials = await _get_credentials(user)
     if credentials is None:
         return
-    service = build("calendar", "v3", credentials=credentials, cache_discovery=False)
-    start = reminder["remind_at"]
-    end = start + timedelta(hours=1)
-    event = {
-        "summary": reminder["title"],
-        "description": reminder["raw_input"],
-        "start": {"dateTime": start.isoformat(), "timeZone": "Asia/Kolkata"},
-        "end": {"dateTime": end.isoformat(), "timeZone": "Asia/Kolkata"},
-    }
-    service.events().patch(calendarId="primary", eventId=event_id, body=event).execute()
+
+    def _update() -> None:
+        service = build("calendar", "v3", credentials=credentials, cache_discovery=False)
+        start = reminder["remind_at"]
+        end = start + timedelta(hours=1)
+        event = {
+            "summary": reminder["title"],
+            "description": reminder["raw_input"],
+            "start": {"dateTime": start.isoformat(), "timeZone": "Asia/Kolkata"},
+            "end": {"dateTime": end.isoformat(), "timeZone": "Asia/Kolkata"},
+        }
+        service.events().patch(calendarId="primary", eventId=event_id, body=event).execute()
+
+    await asyncio.to_thread(_update)
 
 
-def update_google_calendar_event(
+async def update_google_calendar_event(
     user: dict[str, Any],
     event_id: str,
     title: str,
@@ -182,25 +208,29 @@ def update_google_calendar_event(
     end: datetime | str,
     is_all_day: bool,
 ) -> None:
-    credentials = _build_credentials(user)
+    credentials = await _get_credentials(user)
     if credentials is None:
         return
-    service = build("calendar", "v3", credentials=credentials, cache_discovery=False)
-    if is_all_day:
-        event = {
-            "summary": title,
-            "start": {"date": str(start)},
-            "end": {"date": str(end)},
-        }
-    else:
-        start_dt = start if isinstance(start, datetime) else datetime.fromisoformat(str(start))
-        end_dt = end if isinstance(end, datetime) else datetime.fromisoformat(str(end))
-        event = {
-            "summary": title,
-            "start": {"dateTime": start_dt.isoformat(), "timeZone": "Asia/Kolkata"},
-            "end": {"dateTime": end_dt.isoformat(), "timeZone": "Asia/Kolkata"},
-        }
-    service.events().patch(calendarId="primary", eventId=event_id, body=event).execute()
+
+    def _update() -> None:
+        service = build("calendar", "v3", credentials=credentials, cache_discovery=False)
+        if is_all_day:
+            event = {
+                "summary": title,
+                "start": {"date": str(start)},
+                "end": {"date": str(end)},
+            }
+        else:
+            start_dt = start if isinstance(start, datetime) else datetime.fromisoformat(str(start))
+            end_dt = end if isinstance(end, datetime) else datetime.fromisoformat(str(end))
+            event = {
+                "summary": title,
+                "start": {"dateTime": start_dt.isoformat(), "timeZone": "Asia/Kolkata"},
+                "end": {"dateTime": end_dt.isoformat(), "timeZone": "Asia/Kolkata"},
+            }
+        service.events().patch(calendarId="primary", eventId=event_id, body=event).execute()
+
+    await asyncio.to_thread(_update)
 
 
 def _normalize_google_event(event: dict[str, Any]) -> dict[str, Any] | None:
@@ -228,46 +258,54 @@ def _parse_google_datetime(value: str, is_all_day: bool) -> datetime:
     return parsed.astimezone(timezone.utc)
 
 
-def list_calendar_events(
+async def list_calendar_events(
     user: dict[str, Any],
     time_min: datetime,
     time_max: datetime,
 ) -> list[dict[str, Any]]:
-    credentials = _build_credentials(user)
+    credentials = await _get_credentials(user)
     if credentials is None:
         return []
-    service = build("calendar", "v3", credentials=credentials, cache_discovery=False)
-    response = (
-        service.events()
-        .list(
-            calendarId="primary",
-            timeMin=time_min.astimezone(timezone.utc).isoformat(),
-            timeMax=time_max.astimezone(timezone.utc).isoformat(),
-            singleEvents=True,
-            orderBy="startTime",
+
+    def _list() -> list[dict[str, Any]]:
+        service = build("calendar", "v3", credentials=credentials, cache_discovery=False)
+        response = (
+            service.events()
+            .list(
+                calendarId="primary",
+                timeMin=time_min.astimezone(timezone.utc).isoformat(),
+                timeMax=time_max.astimezone(timezone.utc).isoformat(),
+                singleEvents=True,
+                orderBy="startTime",
+            )
+            .execute()
         )
-        .execute()
-    )
-    events = []
-    for event in response.get("items", []):
-        normalized = _normalize_google_event(event)
-        if normalized:
-            events.append(normalized)
-    return events
+        events = []
+        for event in response.get("items", []):
+            normalized = _normalize_google_event(event)
+            if normalized:
+                events.append(normalized)
+        return events
+
+    return await asyncio.to_thread(_list)
 
 
-def get_calendar_event(user: dict[str, Any], event_id: str) -> dict[str, Any] | None:
-    credentials = _build_credentials(user)
+async def get_calendar_event(user: dict[str, Any], event_id: str) -> dict[str, Any] | None:
+    credentials = await _get_credentials(user)
     if credentials is None:
         return None
-    service = build("calendar", "v3", credentials=credentials, cache_discovery=False)
-    try:
-        event = service.events().get(calendarId="primary", eventId=event_id).execute()
-    except HttpError as exc:
-        if getattr(exc, "status_code", None) == 404 or getattr(exc.resp, "status", None) == 404:
-            return None
-        raise
-    return _normalize_google_event(event)
+
+    def _get() -> dict[str, Any] | None:
+        service = build("calendar", "v3", credentials=credentials, cache_discovery=False)
+        try:
+            event = service.events().get(calendarId="primary", eventId=event_id).execute()
+        except HttpError as exc:
+            if getattr(exc, "status_code", None) == 404 or getattr(exc.resp, "status", None) == 404:
+                return None
+            raise
+        return _normalize_google_event(event)
+
+    return await asyncio.to_thread(_get)
 
 
 async def sync_google_calendar_range(
@@ -276,7 +314,7 @@ async def sync_google_calendar_range(
     time_max: datetime,
 ) -> list[dict[str, Any]]:
     db = get_database()
-    google_events = list_calendar_events(user, time_min, time_max)
+    google_events = await list_calendar_events(user, time_min, time_max)
     google_by_id = {event["id"]: event for event in google_events}
     existing = await db.reminders.find(
         {
@@ -321,7 +359,7 @@ async def sync_google_calendar_range(
         reminder = reminders_for_event[0]
         if not event_id:
             continue
-        event = google_by_id.get(event_id) or get_calendar_event(user, event_id)
+        event = google_by_id.get(event_id) or await get_calendar_event(user, event_id)
         if event is None:
             await db.reminders.delete_one({"_id": reminder["_id"]})
             continue
@@ -391,9 +429,13 @@ async def sync_google_calendar_range(
     return reminders
 
 
-def delete_calendar_event(user: dict[str, Any], event_id: str) -> None:
-    credentials = _build_credentials(user)
+async def delete_calendar_event(user: dict[str, Any], event_id: str) -> None:
+    credentials = await _get_credentials(user)
     if credentials is None:
         return
-    service = build("calendar", "v3", credentials=credentials, cache_discovery=False)
-    service.events().delete(calendarId="primary", eventId=event_id).execute()
+
+    def _delete() -> None:
+        service = build("calendar", "v3", credentials=credentials, cache_discovery=False)
+        service.events().delete(calendarId="primary", eventId=event_id).execute()
+
+    await asyncio.to_thread(_delete)

@@ -3,6 +3,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from bson import ObjectId
+from pymongo import ReturnDocument
 
 from config.database import get_database
 from services.email_service import send_client_followup_email, send_reminder_email
@@ -16,6 +17,11 @@ FOLLOW_UP_OFFSETS = [
     timedelta(minutes=125),
     timedelta(days=2),
 ]
+
+# A reminder is "leased" to one worker while it is being dispatched so that
+# concurrent schedulers/instances cannot send the same notification twice. The
+# lease auto-expires after this window in case a worker dies mid-dispatch.
+DISPATCH_LEASE = timedelta(seconds=120)
 
 
 def _ensure_utc(dt: datetime) -> datetime:
@@ -79,6 +85,8 @@ async def process_reminder(reminder: dict[str, Any], user: dict[str, Any]) -> di
         send_client_followup_email(reminder, user.get("name"))
         update_fields["client_email_sent"] = True
 
+    # Release the dispatch lease now that this attempt is fully processed.
+    update_fields["dispatch_locked_at"] = None
     await db.reminders.update_one({"_id": reminder["_id"]}, {"$set": update_fields})
     logger.info("Processed reminder %s", reminder["_id"])
     updated = await db.reminders.find_one({"_id": reminder["_id"]})
@@ -105,28 +113,57 @@ async def process_reminder_by_id(reminder_id: str | ObjectId) -> dict[str, Any] 
     return await process_reminder(reminder, user)
 
 
-async def process_due_reminders(limit: int = 200) -> int:
+async def _claim_due_reminder(now: datetime) -> dict[str, Any] | None:
+    """Atomically claim a single due reminder for dispatch.
+
+    Uses ``find_one_and_update`` so that only one worker can ever take a given
+    reminder: the claim sets ``dispatch_locked_at`` as part of the same query
+    that selects a due, unlocked (or stale-lease) reminder. Returns the claimed
+    document, or ``None`` when nothing is available.
+    """
     db = get_database()
-    now = datetime.now(timezone.utc)
-    cursor = db.reminders.find(
+    lease_cutoff = now - DISPATCH_LEASE
+    return await db.reminders.find_one_and_update(
         {
             "is_done": False,
             "reminder_sequence_completed": {"$ne": True},
-            "$or": [
-                {"next_notification_at": {"$lte": now}},
+            "$and": [
                 {
-                    "next_notification_at": {"$exists": False},
-                    "email_sent": False,
-                    "remind_at": {"$lte": now},
+                    "$or": [
+                        {"next_notification_at": {"$lte": now}},
+                        {
+                            "next_notification_at": {"$exists": False},
+                            "email_sent": False,
+                            "remind_at": {"$lte": now},
+                        },
+                    ]
+                },
+                {
+                    "$or": [
+                        {"dispatch_locked_at": {"$exists": False}},
+                        {"dispatch_locked_at": None},
+                        {"dispatch_locked_at": {"$lte": lease_cutoff}},
+                    ]
                 },
             ],
-        }
+        },
+        {"$set": {"dispatch_locked_at": now}},
+        return_document=ReturnDocument.AFTER,
     )
-    reminders = await cursor.to_list(length=limit)
+
+
+async def process_due_reminders(limit: int = 200) -> int:
+    db = get_database()
     processed_count = 0
-    for reminder in reminders:
+    for _ in range(limit):
+        now = datetime.now(timezone.utc)
+        reminder = await _claim_due_reminder(now)
+        if reminder is None:
+            break
         user = await db.users.find_one({"_id": reminder["user_id"]})
         if not user:
+            # Leave the lease in place so a missing user doesn't hot-loop;
+            # it expires after DISPATCH_LEASE and is retried later.
             continue
         try:
             await process_reminder(reminder, user)
